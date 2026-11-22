@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check app migrations scripts tests --ignore E402,E501
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tickets_test
+          POSTGRES_USER: tickets
+          POSTGRES_PASSWORD: tickets
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tickets -d tickets_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://tickets:tickets@localhost:5432/tickets_test
+      JWT_SECRET: ci-only-secret-change-me
+      AUTO_CREATE_SCHEMA: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: alembic upgrade head
+      - run: pytest -q
