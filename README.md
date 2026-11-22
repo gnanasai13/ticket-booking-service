@@ -22,6 +22,56 @@ Redis is used for distributed write-request rate limits, where shared counters
 between API replicas are useful. The upcoming event list is cached for 30 seconds;
 event writes invalidate it. Seat availability is never cached.
 
+## Architecture
+
+The API coordinates reservation requests, but PostgreSQL is the authority for
+seat ownership. The database transaction, row locks, and partial unique index
+protect the booking invariant. Redis is used for request rate limiting and the
+upcoming-event list cache; seat availability is read from PostgreSQL.
+
+```mermaid
+flowchart LR
+    C[Client] --> API[FastAPI application]
+    API --> AUTH[Authentication and request middleware]
+    API <--> RL[Redis rate limiter]
+    API <--> EC[Redis upcoming-event cache]
+    EC -. cache miss .-> PG[(PostgreSQL)]
+    API --> TX[Reservation transaction]
+    TX --> LOCK[Lock requested seat rows]
+    LOCK --> CHECK[Check live claims]
+    CHECK --> IDX[Partial unique index guard]
+    IDX --> PG
+
+    PG -->|holds and bookings| DATA[(Reservation and booking data)]
+    W[Expiry worker] -->|FOR UPDATE SKIP LOCKED| PG
+    PG --> OUTBOX[(Notification outbox)]
+    OUTBOX --> NW[Outbox worker]
+    NW --> LOG[Mark simulated and log event]
+
+    API --> PAY[Simulated payment endpoint]
+    PAY --> PG
+```
+
+**Important design decisions**
+
+- Seat rows are locked in ascending ID order while a hold is created. The partial
+  unique index on live seat claims is the final database-level guard against two
+  reservations claiming the same seat.
+- Idempotency keys make retried hold and confirmation requests return the
+  original result instead of creating duplicate reservations.
+- The expiry worker uses `FOR UPDATE SKIP LOCKED` so multiple worker instances
+  can process different expired reservations without taking the same work.
+- Redis never decides whether a seat is available. PostgreSQL remains the source
+  of truth for holds, confirmations, and cancellations.
+- The notification outbox records events transactionally. In this implementation,
+  the worker marks notifications as simulated and logs them; no email provider is
+  connected. Payment attempts are also simulated and do not transfer money or
+  change seat ownership.
+
+> **Code layout note:** Route handlers currently live in `app/main.py`. The
+> diagram describes runtime responsibilities and data flow, not separate
+> deployed services or a completed router/service refactor.
+
 ## Run locally
 
 ```sh
@@ -114,7 +164,6 @@ local, so aggregate them across API replicas in your monitoring system. There is
 no actual payment provider or email delivery. Use migrations for schema changes;
 `create_all` is enabled only for local/test startup.
 
-
 ## Configuration
 
 Copy `.env.example` to `.env` before starting the stack. Set `JWT_SECRET` to a
@@ -143,7 +192,7 @@ app/
   database.py           # SQLAlchemy engine and session factory
   main.py               # FastAPI routes and request middleware
   models.py             # SQLAlchemy models and constraints
-  schemas.py            # API request/response schemas
+  schemas.py             # API request/response schemas
   expiry_worker.py      # Reservation expiry and outbox worker
   notifications.py      # Transactional outbox processing
 migrations/             # Alembic schema revisions
